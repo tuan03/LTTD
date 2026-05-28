@@ -148,7 +148,6 @@ def main():
             else:
                 opponents.append(make_opponent(pid, random.choice(opponent_names)))
 
-        prev_obs = None
         ep_reward = 0.0
         for _ in range(args.max_steps):
             map_x, aux = encode_obs(obs, args.agent_id)
@@ -176,10 +175,9 @@ def main():
 
             next_obs, terminated, truncated = env.step(actions)
             done = bool(terminated or truncated or int(next_obs["players"][args.agent_id][2]) != 1)
-            reward = shaped_reward(prev_obs, next_obs, args.agent_id)
+            reward = shaped_reward(obs, next_obs, args.agent_id)
             ep_reward += reward
             buffer.append((map_x, aux, mask, action, logp, val, reward, done))
-            prev_obs = obs
             obs = next_obs
             if done:
                 break

@@ -6,6 +6,7 @@ import random
 import sys
 
 import numpy as np
+from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -50,7 +51,8 @@ def main():
     survived = 0
     steps = []
 
-    for ep in range(args.episodes):
+    progress = tqdm(range(args.episodes), desc="evaluate", unit="episode")
+    for ep in progress:
         obs = env.reset(seed=args.seed + ep)
         agents = [None] * 4
         agents[args.agent_id] = make_agent(args.agent_id, "lgl")
@@ -78,6 +80,12 @@ def main():
         if alive[args.agent_id] and sum(alive) == 1:
             wins += 1
         steps.append(step)
+        completed = ep + 1
+        progress.set_postfix(
+            win=f"{wins / completed:.3f}",
+            survived=f"{survived / completed:.3f}",
+            avg_steps=f"{float(np.mean(steps)):.1f}",
+        )
 
     print("=== LGL evaluation ===")
     print(f"episodes: {args.episodes}")

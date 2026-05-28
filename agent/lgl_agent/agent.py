@@ -338,11 +338,32 @@ class Agent:
     def _danger_time_map(self, grid, players, bombs):
         h, w = grid.shape
         danger = np.full((h, w), 99, dtype=np.int16)
+        bomb_infos = []
         for bx, by, timer, owner in bombs:
-            owner = int(owner)
+            bx, by, timer, owner = int(bx), int(by), max(0, int(timer)), int(owner)
             radius = 1 + int(players[owner][4]) if 0 <= owner < len(players) else 2
-            for tx, ty in _blast_tiles(grid, int(bx), int(by), radius):
-                danger[tx, ty] = min(danger[tx, ty], max(0, int(timer)))
+            bomb_infos.append(
+                {
+                    "pos": (bx, by),
+                    "time": timer,
+                    "tiles": _blast_tiles(grid, bx, by, radius),
+                }
+            )
+
+        changed = True
+        while changed:
+            changed = False
+            for src in bomb_infos:
+                for dst in bomb_infos:
+                    if src is dst:
+                        continue
+                    if dst["pos"] in src["tiles"] and src["time"] < dst["time"]:
+                        dst["time"] = src["time"]
+                        changed = True
+
+        for bomb in bomb_infos:
+            for tx, ty in bomb["tiles"]:
+                danger[tx, ty] = min(danger[tx, ty], bomb["time"])
         return danger
 
     def _danger_at(self, danger_time, pos, arrive_time):
