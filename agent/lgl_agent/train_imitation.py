@@ -179,18 +179,9 @@ def collect_dataset_parallel(args):
             shard_path = shard_dir / f"shard_{worker_id:03d}.npz"
             payloads.append((args, worker_id, episodes_per_worker, samples_per_worker, shard_path, progress_queue))
 
-        bars = []
-        for worker_id in range(worker_count):
-            total = samples_per_worker if samples_per_worker else None
-            bars.append(
-                tqdm(
-                    total=total,
-                    desc=f"worker {worker_id}",
-                    unit="sample",
-                    position=worker_id,
-                    leave=True,
-                )
-            )
+        total_samples = int(args.max_samples) if args.max_samples else None
+        progress = tqdm(total=total_samples, desc="collect", unit="sample")
+        worker_samples = [0] * worker_count
 
         shard_paths = []
         collected = 0
@@ -204,7 +195,14 @@ def collect_dataset_parallel(args):
                             worker_id, delta = progress_queue.get_nowait()
                         except Empty:
                             break
-                        bars[int(worker_id)].update(int(delta))
+                        worker_id = int(worker_id)
+                        delta = int(delta)
+                        worker_samples[worker_id] += delta
+                        progress.update(delta)
+                        progress.set_postfix(
+                            workers="/".join(str(v) for v in worker_samples),
+                            total=sum(worker_samples),
+                        )
 
                     done = [future for future in list(pending) if future.done()]
                     for future in done:
@@ -213,9 +211,15 @@ def collect_dataset_parallel(args):
                         shard_paths.append(shard_path)
                         collected += count
                         worker_id = int(Path(shard_path).stem.split("_")[-1])
-                        if bars[worker_id].total is not None and bars[worker_id].n < min(count, bars[worker_id].total):
-                            bars[worker_id].update(min(count, bars[worker_id].total) - bars[worker_id].n)
-                        bars[worker_id].set_postfix(samples=count)
+                        if worker_samples[worker_id] < count:
+                            delta = count - worker_samples[worker_id]
+                            worker_samples[worker_id] = count
+                            progress.update(delta)
+                        progress.set_postfix(
+                            workers="/".join(str(v) for v in worker_samples),
+                            total=sum(worker_samples),
+                            done=f"{worker_count - len(pending)}/{worker_count}",
+                        )
                     if pending:
                         time.sleep(0.1)
 
@@ -224,10 +228,16 @@ def collect_dataset_parallel(args):
                         worker_id, delta = progress_queue.get_nowait()
                     except Empty:
                         break
-                    bars[int(worker_id)].update(int(delta))
+                    worker_id = int(worker_id)
+                    delta = int(delta)
+                    worker_samples[worker_id] += delta
+                    progress.update(delta)
+                    progress.set_postfix(
+                        workers="/".join(str(v) for v in worker_samples),
+                        total=sum(worker_samples),
+                    )
         finally:
-            for bar in bars:
-                bar.close()
+            progress.close()
 
     total = merge_shards(sorted(shard_paths), args.output, max_samples=args.max_samples, compressed=args.compressed)
     print(f"saved {total} samples to {args.output} from {worker_count} workers")
