@@ -452,15 +452,29 @@ class Agent:
             danger[tx, ty] = min(danger[tx, ty], BOMB_TIMER)
         simulated["danger_time"] = danger
         simulated["blocked"] = set(c["blocked"]) | {my_pos}
-        return self._escape_after_new_bomb(simulated, my_pos, my_blast)
+        escape_actions, max_open = self._escape_options_after_new_bomb(simulated, my_pos, my_blast)
+        if not escape_actions:
+            return False
+        if self._nearest_enemy_distance(c) <= 5 and len(escape_actions) < 2 and max_open < 2:
+            return False
+        return True
 
     def _escape_after_new_bomb(self, c, start, new_blast):
+        escape_actions, _ = self._escape_options_after_new_bomb(c, start, new_blast)
+        return bool(escape_actions)
+
+    def _escape_options_after_new_bomb(self, c, start, new_blast):
         q = deque([(start, 0, None)])
         seen = {(start, 0)}
+        escape_actions = set()
+        max_open = 0
         while q:
             pos, t, first = q.popleft()
             if t > 0 and pos not in new_blast and not self._danger_at(c["danger_time"], pos, t):
-                return True
+                if first is not None:
+                    escape_actions.add(first)
+                max_open = max(max_open, self._open_neighbor_count(c, pos))
+                continue
             if t >= BOMB_TIMER - 1:
                 continue
             for action in (1, 2, 3, 4, 0):
@@ -480,7 +494,7 @@ class Agent:
                     continue
                 seen.add(key)
                 q.append((npos, nt, action if first is None else first))
-        return False
+        return escape_actions, max_open
 
     def _move_to_targets(self, c, targets, safe_actions, max_depth=12):
         if not targets:
