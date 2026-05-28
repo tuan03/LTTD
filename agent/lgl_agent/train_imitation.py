@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import argparse
 import math
+import multiprocessing as mp
 from pathlib import Path
+from queue import Empty
 import random
 import shutil
 import sys
+import time
 
 import numpy as np
 import torch
@@ -49,7 +52,7 @@ def save_dataset(output_path, maps, auxes, actions_out, compressed=False):
     tmp_output.replace(output)
 
 
-def collect_samples(args, seed, episodes, max_samples, flush_path=None):
+def collect_samples(args, seed, episodes, max_samples, flush_path=None, worker_id=0, progress_queue=None):
     rng = random.Random(seed)
     env = BomberEnv(max_steps=args.max_steps, seed=seed)
     teacher = Agent(args.agent_id)
@@ -60,6 +63,8 @@ def collect_samples(args, seed, episodes, max_samples, flush_path=None):
     actions_out = []
     opponent_names = ["tactical", "genius", "smarter", "box_farmer", "random"]
     next_flush = args.flush_every if args.flush_every > 0 and flush_path is not None else None
+    next_progress = args.progress_every if args.progress_every > 0 and progress_queue is not None else None
+    last_progress = 0
 
     for ep in range(episodes):
         obs = env.reset(seed=seed + ep)
@@ -80,6 +85,10 @@ def collect_samples(args, seed, episodes, max_samples, flush_path=None):
             if next_flush is not None and len(actions_out) >= next_flush:
                 save_dataset(flush_path, maps, auxes, actions_out, compressed=args.compressed)
                 next_flush += args.flush_every
+            if next_progress is not None and len(actions_out) >= next_progress:
+                progress_queue.put((worker_id, len(actions_out) - last_progress))
+                last_progress = len(actions_out)
+                next_progress += args.progress_every
 
             step_actions = []
             for pid, agent in enumerate(opponents):
@@ -95,13 +104,23 @@ def collect_samples(args, seed, episodes, max_samples, flush_path=None):
         if max_samples and len(actions_out) >= max_samples:
             break
 
+    if progress_queue is not None and len(actions_out) > last_progress:
+        progress_queue.put((worker_id, len(actions_out) - last_progress))
     return maps, auxes, actions_out
 
 
 def collect_worker(payload):
-    args, worker_id, episodes, max_samples, shard_path = payload
+    args, worker_id, episodes, max_samples, shard_path, progress_queue = payload
     seed = int(args.seed) + worker_id * 1000003
-    maps, auxes, actions_out = collect_samples(args, seed, episodes, max_samples, flush_path=shard_path)
+    maps, auxes, actions_out = collect_samples(
+        args,
+        seed,
+        episodes,
+        max_samples,
+        flush_path=shard_path,
+        worker_id=worker_id,
+        progress_queue=progress_queue,
+    )
     save_dataset(shard_path, maps, auxes, actions_out, compressed=args.compressed)
     return str(shard_path), len(actions_out)
 
@@ -137,7 +156,7 @@ def merge_shards(shard_paths, output_path, max_samples=0, compressed=False):
 
 
 def collect_dataset_parallel(args):
-    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from concurrent.futures import ProcessPoolExecutor
 
     worker_count = max(1, int(args.workers))
     samples_per_worker = 0
@@ -153,20 +172,62 @@ def collect_dataset_parallel(args):
         shutil.rmtree(shard_dir)
     shard_dir.mkdir(parents=True, exist_ok=True)
 
-    payloads = []
-    for worker_id in range(worker_count):
-        shard_path = shard_dir / f"shard_{worker_id:03d}.npz"
-        payloads.append((args, worker_id, episodes_per_worker, samples_per_worker, shard_path))
+    with mp.Manager() as manager:
+        progress_queue = manager.Queue()
+        payloads = []
+        for worker_id in range(worker_count):
+            shard_path = shard_dir / f"shard_{worker_id:03d}.npz"
+            payloads.append((args, worker_id, episodes_per_worker, samples_per_worker, shard_path, progress_queue))
 
-    shard_paths = []
-    collected = 0
-    with ProcessPoolExecutor(max_workers=worker_count) as pool:
-        futures = [pool.submit(collect_worker, payload) for payload in payloads]
-        for future in tqdm(as_completed(futures), total=len(futures), desc="collect shards"):
-            shard_path, count = future.result()
-            shard_paths.append(shard_path)
-            collected += count
-            print(f"shard saved {count} samples to {shard_path}")
+        bars = []
+        for worker_id in range(worker_count):
+            total = samples_per_worker if samples_per_worker else None
+            bars.append(
+                tqdm(
+                    total=total,
+                    desc=f"worker {worker_id}",
+                    unit="sample",
+                    position=worker_id,
+                    leave=True,
+                )
+            )
+
+        shard_paths = []
+        collected = 0
+        try:
+            with ProcessPoolExecutor(max_workers=worker_count) as pool:
+                futures = [pool.submit(collect_worker, payload) for payload in payloads]
+                pending = set(futures)
+                while pending:
+                    while True:
+                        try:
+                            worker_id, delta = progress_queue.get_nowait()
+                        except Empty:
+                            break
+                        bars[int(worker_id)].update(int(delta))
+
+                    done = [future for future in list(pending) if future.done()]
+                    for future in done:
+                        pending.remove(future)
+                        shard_path, count = future.result()
+                        shard_paths.append(shard_path)
+                        collected += count
+                        worker_id = int(Path(shard_path).stem.split("_")[-1])
+                        if bars[worker_id].total is not None and bars[worker_id].n < min(count, bars[worker_id].total):
+                            bars[worker_id].update(min(count, bars[worker_id].total) - bars[worker_id].n)
+                        bars[worker_id].set_postfix(samples=count)
+                    if pending:
+                        time.sleep(0.1)
+
+                while True:
+                    try:
+                        worker_id, delta = progress_queue.get_nowait()
+                    except Empty:
+                        break
+                    bars[int(worker_id)].update(int(delta))
+        finally:
+            for bar in bars:
+                bar.close()
 
     total = merge_shards(sorted(shard_paths), args.output, max_samples=args.max_samples, compressed=args.compressed)
     print(f"saved {total} samples to {args.output} from {worker_count} workers")
@@ -310,6 +371,7 @@ def main():
     collect.add_argument("--compressed", action="store_true")
     collect.add_argument("--rule_only_teacher", action=argparse.BooleanOptionalAction, default=True)
     collect.add_argument("--workers", type=int, default=1)
+    collect.add_argument("--progress_every", type=int, default=100)
 
     train = sub.add_parser("train")
     train.add_argument("--dataset", type=str, default="agent/lgl_agent/data/imitation_dataset.npz")
