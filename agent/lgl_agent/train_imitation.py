@@ -161,6 +161,22 @@ def merge_shards(shard_paths, output_path, max_samples=0, compressed=False):
     return total
 
 
+def choose_torch_device(force_cpu=False):
+    if force_cpu or not torch.cuda.is_available():
+        print("using device: cpu")
+        return torch.device("cpu")
+    try:
+        device = torch.device("cuda")
+        test = torch.ones((1,), device=device)
+        _ = (test + 1).cpu().item()
+        name = torch.cuda.get_device_name(0)
+        print(f"using device: cuda ({name})")
+        return device
+    except Exception as exc:
+        print(f"CUDA is visible but unusable, falling back to CPU: {exc}")
+        return torch.device("cpu")
+
+
 def collect_dataset_parallel(args):
     from concurrent.futures import ProcessPoolExecutor
 
@@ -341,10 +357,14 @@ def train_bc(args):
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size)
 
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    device = choose_torch_device(args.cpu)
     model = PolicyNet().to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     loss_fn = nn.CrossEntropyLoss()
+    best_val_acc = -1.0
+    best_val_loss = float("inf")
+    best_state = None
+    stale_epochs = 0
 
     for epoch in range(args.epochs):
         model.train()
@@ -364,20 +384,42 @@ def train_bc(args):
             correct += int((logits.argmax(1) == mb_y).sum().item())
             seen += len(mb_y)
 
-        val_acc = evaluate_accuracy(model, val_loader, device)
+        val_loss, val_acc = evaluate_validation(model, val_loader, loss_fn, device)
+        improved = val_acc > best_val_acc + args.min_delta
+        if improved:
+            best_val_acc = val_acc
+            best_val_loss = val_loss
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            stale_epochs = 0
+        else:
+            stale_epochs += 1
         print(
             f"epoch={epoch + 1} loss={total_loss / max(1, seen):.4f} "
-            f"train_acc={correct / max(1, seen):.3f} val_acc={val_acc:.3f}"
+            f"train_acc={correct / max(1, seen):.3f} val_loss={val_loss:.4f} "
+            f"val_acc={val_acc:.3f} best_val_acc={best_val_acc:.3f} stale={stale_epochs}"
         )
+        if args.patience > 0 and stale_epochs >= args.patience:
+            print(f"early stopping after {epoch + 1} epochs")
+            break
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"model_state_dict": model.cpu().state_dict()}, output)
+    if best_state is not None and args.save_best:
+        model.load_state_dict(best_state)
+    torch.save(
+        {
+            "model_state_dict": model.cpu().state_dict(),
+            "best_val_acc": best_val_acc,
+            "best_val_loss": best_val_loss,
+        },
+        output,
+    )
     print(f"saved policy to {output}")
 
 
-def evaluate_accuracy(model, loader, device):
+def evaluate_validation(model, loader, loss_fn, device):
     model.eval()
+    total_loss = 0.0
     correct = 0
     seen = 0
     with torch.no_grad():
@@ -385,10 +427,12 @@ def evaluate_accuracy(model, loader, device):
             mb_map = mb_map.to(device)
             mb_aux = mb_aux.to(device)
             mb_y = mb_y.to(device)
-            pred = model(mb_map, mb_aux).argmax(1)
+            logits = model(mb_map, mb_aux)
+            total_loss += float(loss_fn(logits, mb_y).item()) * len(mb_y)
+            pred = logits.argmax(1)
             correct += int((pred == mb_y).sum().item())
             seen += len(mb_y)
-    return correct / max(1, seen)
+    return total_loss / max(1, seen), correct / max(1, seen)
 
 
 def main():
@@ -416,6 +460,9 @@ def main():
     train.add_argument("--batch_size", type=int, default=256)
     train.add_argument("--lr", type=float, default=3e-4)
     train.add_argument("--cpu", action="store_true")
+    train.add_argument("--patience", type=int, default=10)
+    train.add_argument("--min_delta", type=float, default=0.001)
+    train.add_argument("--save_best", action=argparse.BooleanOptionalAction, default=True)
 
     args = parser.parse_args()
     if args.cmd == "collect":

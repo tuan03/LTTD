@@ -63,6 +63,22 @@ def masked_distribution(policy, map_x, aux_x, mask, device):
     return torch.distributions.Categorical(logits=logits)
 
 
+def choose_torch_device(force_cpu=False):
+    if force_cpu or not torch.cuda.is_available():
+        print("using device: cpu")
+        return torch.device("cpu")
+    try:
+        device = torch.device("cuda")
+        test = torch.ones((1,), device=device)
+        _ = (test + 1).cpu().item()
+        name = torch.cuda.get_device_name(0)
+        print(f"using device: cuda ({name})")
+        return device
+    except Exception as exc:
+        print(f"CUDA is visible but unusable, falling back to CPU: {exc}")
+        return torch.device("cpu")
+
+
 def safe_mask(agent: Agent, obs):
     c = agent._build_context(obs)
     actions = agent._safe_actions(c)
@@ -124,7 +140,7 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    device = choose_torch_device(args.cpu)
 
     env = BomberEnv(max_steps=args.max_steps, seed=args.seed)
     policy = PolicyNet().to(device)
