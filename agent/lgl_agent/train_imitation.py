@@ -63,6 +63,7 @@ def collect_samples(args, seed, episodes, max_samples, flush_path=None, worker_i
     actions_out = []
     opponent_names = ["tactical", "genius", "smarter", "box_farmer", "random"]
     next_flush = args.flush_every if args.flush_every > 0 and flush_path is not None else None
+    next_episode_flush = args.flush_episodes if args.flush_episodes > 0 and flush_path is not None else None
     next_progress = args.progress_every if args.progress_every > 0 and progress_queue is not None else None
     last_progress = 0
 
@@ -86,7 +87,7 @@ def collect_samples(args, seed, episodes, max_samples, flush_path=None, worker_i
                 save_dataset(flush_path, maps, auxes, actions_out, compressed=args.compressed)
                 next_flush += args.flush_every
             if next_progress is not None and len(actions_out) >= next_progress:
-                progress_queue.put((worker_id, len(actions_out) - last_progress))
+                progress_queue.put(("sample", worker_id, len(actions_out) - last_progress))
                 last_progress = len(actions_out)
                 next_progress += args.progress_every
 
@@ -101,11 +102,16 @@ def collect_samples(args, seed, episodes, max_samples, flush_path=None, worker_i
                 break
             if max_samples and len(actions_out) >= max_samples:
                 break
+        if progress_queue is not None:
+            progress_queue.put(("episode", worker_id, 1))
+        if next_episode_flush is not None and ep + 1 >= next_episode_flush:
+            save_dataset(flush_path, maps, auxes, actions_out, compressed=args.compressed)
+            next_episode_flush += args.flush_episodes
         if max_samples and len(actions_out) >= max_samples:
             break
 
     if progress_queue is not None and len(actions_out) > last_progress:
-        progress_queue.put((worker_id, len(actions_out) - last_progress))
+        progress_queue.put(("sample", worker_id, len(actions_out) - last_progress))
     return maps, auxes, actions_out
 
 
@@ -160,10 +166,11 @@ def collect_dataset_parallel(args):
 
     worker_count = max(1, int(args.workers))
     samples_per_worker = 0
-    episodes_per_worker = max(1, math.ceil(args.episodes / worker_count))
+    base_episodes = int(args.episodes) // worker_count
+    extra_episodes = int(args.episodes) % worker_count
+    worker_episodes = [base_episodes + (1 if worker_id < extra_episodes else 0) for worker_id in range(worker_count)]
     if args.max_samples:
         samples_per_worker = math.ceil(args.max_samples / worker_count)
-        episodes_per_worker = max(1, args.episodes)
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -177,11 +184,11 @@ def collect_dataset_parallel(args):
         payloads = []
         for worker_id in range(worker_count):
             shard_path = shard_dir / f"shard_{worker_id:03d}.npz"
-            payloads.append((args, worker_id, episodes_per_worker, samples_per_worker, shard_path, progress_queue))
+            payloads.append((args, worker_id, worker_episodes[worker_id], samples_per_worker, shard_path, progress_queue))
 
-        total_samples = int(args.max_samples) if args.max_samples else None
-        progress = tqdm(total=total_samples, desc="collect", unit="sample")
+        progress = tqdm(total=int(args.episodes), desc="collect episodes", unit="episode")
         worker_samples = [0] * worker_count
+        worker_done_episodes = [0] * worker_count
 
         shard_paths = []
         collected = 0
@@ -192,16 +199,21 @@ def collect_dataset_parallel(args):
                 while pending:
                     while True:
                         try:
-                            worker_id, delta = progress_queue.get_nowait()
+                            event_type, worker_id, delta = progress_queue.get_nowait()
                         except Empty:
                             break
                         worker_id = int(worker_id)
                         delta = int(delta)
-                        worker_samples[worker_id] += delta
-                        progress.update(delta)
+                        if event_type == "episode":
+                            worker_done_episodes[worker_id] += delta
+                            progress.update(delta)
+                        else:
+                            worker_samples[worker_id] += delta
                         progress.set_postfix(
-                            workers="/".join(str(v) for v in worker_samples),
-                            total=sum(worker_samples),
+                            samples=sum(worker_samples),
+                            target=args.max_samples or "all",
+                            eps="/".join(str(v) for v in worker_done_episodes),
+                            sample_workers="/".join(str(v) for v in worker_samples),
                         )
 
                     done = [future for future in list(pending) if future.done()]
@@ -214,10 +226,11 @@ def collect_dataset_parallel(args):
                         if worker_samples[worker_id] < count:
                             delta = count - worker_samples[worker_id]
                             worker_samples[worker_id] = count
-                            progress.update(delta)
                         progress.set_postfix(
-                            workers="/".join(str(v) for v in worker_samples),
-                            total=sum(worker_samples),
+                            samples=sum(worker_samples),
+                            target=args.max_samples or "all",
+                            eps="/".join(str(v) for v in worker_done_episodes),
+                            sample_workers="/".join(str(v) for v in worker_samples),
                             done=f"{worker_count - len(pending)}/{worker_count}",
                         )
                     if pending:
@@ -225,16 +238,21 @@ def collect_dataset_parallel(args):
 
                 while True:
                     try:
-                        worker_id, delta = progress_queue.get_nowait()
+                        event_type, worker_id, delta = progress_queue.get_nowait()
                     except Empty:
                         break
                     worker_id = int(worker_id)
                     delta = int(delta)
-                    worker_samples[worker_id] += delta
-                    progress.update(delta)
+                    if event_type == "episode":
+                        worker_done_episodes[worker_id] += delta
+                        progress.update(delta)
+                    else:
+                        worker_samples[worker_id] += delta
                     progress.set_postfix(
-                        workers="/".join(str(v) for v in worker_samples),
-                        total=sum(worker_samples),
+                        samples=sum(worker_samples),
+                        target=args.max_samples or "all",
+                        eps="/".join(str(v) for v in worker_done_episodes),
+                        sample_workers="/".join(str(v) for v in worker_samples),
                     )
         finally:
             progress.close()
@@ -259,8 +277,10 @@ def collect_dataset(args):
     actions_out = []
     opponent_names = ["tactical", "genius", "smarter", "box_farmer", "random"]
     next_flush = args.flush_every if args.flush_every > 0 else None
+    next_episode_flush = args.flush_episodes if args.flush_episodes > 0 else None
 
-    for ep in tqdm(range(args.episodes), desc="collect"):
+    progress = tqdm(range(args.episodes), desc="collect episodes", unit="episode")
+    for ep in progress:
         obs = env.reset(seed=args.seed + ep)
         opponents = []
         for pid in range(4):
@@ -292,6 +312,11 @@ def collect_dataset(args):
                 break
             if args.max_samples and len(actions_out) >= args.max_samples:
                 break
+        progress.set_postfix(samples=len(actions_out), target=args.max_samples or "all")
+        if next_episode_flush is not None and ep + 1 >= next_episode_flush:
+            save_dataset(args.output, maps, auxes, actions_out, compressed=args.compressed)
+            print(f"episode checkpoint saved {len(actions_out)} samples after {ep + 1} episodes to {args.output}")
+            next_episode_flush += args.flush_episodes
         if args.max_samples and len(actions_out) >= args.max_samples:
             break
 
@@ -378,6 +403,7 @@ def main():
     collect.add_argument("--output", type=str, default="agent/lgl_agent/data/imitation_dataset.npz")
     collect.add_argument("--max_samples", type=int, default=0)
     collect.add_argument("--flush_every", type=int, default=1000)
+    collect.add_argument("--flush_episodes", type=int, default=10)
     collect.add_argument("--compressed", action="store_true")
     collect.add_argument("--rule_only_teacher", action=argparse.BooleanOptionalAction, default=True)
     collect.add_argument("--workers", type=int, default=1)
