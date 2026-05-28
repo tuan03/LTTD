@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 import random
+import shutil
 import sys
 
 import numpy as np
@@ -32,14 +34,160 @@ def make_opponent(agent_id: int, name: str):
     return TacticalRuleAgent(agent_id)
 
 
-def collect_dataset(args):
-    rng = random.Random(args.seed)
-    env = BomberEnv(max_steps=args.max_steps, seed=args.seed)
+def save_dataset(output_path, maps, auxes, actions_out, compressed=False):
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    tmp_output = output.with_name(output.name + ".tmp")
+    payload = {
+        "map": np.asarray(maps, dtype=np.float32),
+        "aux": np.asarray(auxes, dtype=np.float32),
+        "action": np.asarray(actions_out, dtype=np.int64),
+    }
+    saver = np.savez_compressed if compressed else np.savez
+    with tmp_output.open("wb") as f:
+        saver(f, **payload)
+    tmp_output.replace(output)
+
+
+def collect_samples(args, seed, episodes, max_samples, flush_path=None):
+    rng = random.Random(seed)
+    env = BomberEnv(max_steps=args.max_steps, seed=seed)
     teacher = Agent(args.agent_id)
+    if args.rule_only_teacher:
+        teacher.model = None
     maps = []
     auxes = []
     actions_out = []
     opponent_names = ["tactical", "genius", "smarter", "box_farmer", "random"]
+    next_flush = args.flush_every if args.flush_every > 0 and flush_path is not None else None
+
+    for ep in range(episodes):
+        obs = env.reset(seed=seed + ep)
+        opponents = []
+        for pid in range(4):
+            if pid == args.agent_id:
+                opponents.append(teacher)
+            else:
+                opponents.append(make_opponent(pid, rng.choice(opponent_names)))
+
+        for _ in range(args.max_steps):
+            action = int(teacher.act(obs))
+            map_x, aux = encode_obs(obs, args.agent_id)
+            maps.append(map_x)
+            auxes.append(aux)
+            actions_out.append(action)
+
+            if next_flush is not None and len(actions_out) >= next_flush:
+                save_dataset(flush_path, maps, auxes, actions_out, compressed=args.compressed)
+                next_flush += args.flush_every
+
+            step_actions = []
+            for pid, agent in enumerate(opponents):
+                try:
+                    step_actions.append(int(agent.act(obs)))
+                except Exception:
+                    step_actions.append(0)
+            obs, terminated, truncated = env.step(step_actions)
+            if terminated or truncated or int(obs["players"][args.agent_id][2]) != 1:
+                break
+            if max_samples and len(actions_out) >= max_samples:
+                break
+        if max_samples and len(actions_out) >= max_samples:
+            break
+
+    return maps, auxes, actions_out
+
+
+def collect_worker(payload):
+    args, worker_id, episodes, max_samples, shard_path = payload
+    seed = int(args.seed) + worker_id * 1000003
+    maps, auxes, actions_out = collect_samples(args, seed, episodes, max_samples, flush_path=shard_path)
+    save_dataset(shard_path, maps, auxes, actions_out, compressed=args.compressed)
+    return str(shard_path), len(actions_out)
+
+
+def merge_shards(shard_paths, output_path, max_samples=0, compressed=False):
+    map_parts = []
+    aux_parts = []
+    action_parts = []
+    total = 0
+    for shard_path in shard_paths:
+        data = np.load(shard_path)
+        remaining = max_samples - total if max_samples else len(data["action"])
+        take = min(len(data["action"]), remaining)
+        if take <= 0:
+            break
+        map_parts.append(data["map"][:take])
+        aux_parts.append(data["aux"][:take])
+        action_parts.append(data["action"][:take])
+        total += take
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    tmp_output = output.with_name(output.name + ".tmp")
+    saver = np.savez_compressed if compressed else np.savez
+    with tmp_output.open("wb") as f:
+        saver(
+            f,
+            map=np.concatenate(map_parts, axis=0) if map_parts else np.empty((0, 12, 13, 13), dtype=np.float32),
+            aux=np.concatenate(aux_parts, axis=0) if aux_parts else np.empty((0, 16), dtype=np.float32),
+            action=np.concatenate(action_parts, axis=0) if action_parts else np.empty((0,), dtype=np.int64),
+        )
+    tmp_output.replace(output)
+    return total
+
+
+def collect_dataset_parallel(args):
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    worker_count = max(1, int(args.workers))
+    samples_per_worker = 0
+    episodes_per_worker = max(1, math.ceil(args.episodes / worker_count))
+    if args.max_samples:
+        samples_per_worker = math.ceil(args.max_samples / worker_count)
+        episodes_per_worker = max(1, args.episodes)
+
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    shard_dir = output.parent / f"{output.stem}_shards"
+    if shard_dir.exists():
+        shutil.rmtree(shard_dir)
+    shard_dir.mkdir(parents=True, exist_ok=True)
+
+    payloads = []
+    for worker_id in range(worker_count):
+        shard_path = shard_dir / f"shard_{worker_id:03d}.npz"
+        payloads.append((args, worker_id, episodes_per_worker, samples_per_worker, shard_path))
+
+    shard_paths = []
+    collected = 0
+    with ProcessPoolExecutor(max_workers=worker_count) as pool:
+        futures = [pool.submit(collect_worker, payload) for payload in payloads]
+        for future in tqdm(as_completed(futures), total=len(futures), desc="collect shards"):
+            shard_path, count = future.result()
+            shard_paths.append(shard_path)
+            collected += count
+            print(f"shard saved {count} samples to {shard_path}")
+
+    total = merge_shards(sorted(shard_paths), args.output, max_samples=args.max_samples, compressed=args.compressed)
+    print(f"saved {total} samples to {args.output} from {worker_count} workers")
+    print(f"shards kept in {shard_dir}")
+
+
+def collect_dataset(args):
+    if int(args.workers) > 1:
+        collect_dataset_parallel(args)
+        return
+
+    rng = random.Random(args.seed)
+    env = BomberEnv(max_steps=args.max_steps, seed=args.seed)
+    teacher = Agent(args.agent_id)
+    if args.rule_only_teacher:
+        teacher.model = None
+    maps = []
+    auxes = []
+    actions_out = []
+    opponent_names = ["tactical", "genius", "smarter", "box_farmer", "random"]
+    next_flush = args.flush_every if args.flush_every > 0 else None
 
     for ep in tqdm(range(args.episodes), desc="collect"):
         obs = env.reset(seed=args.seed + ep)
@@ -57,6 +205,11 @@ def collect_dataset(args):
             auxes.append(aux)
             actions_out.append(action)
 
+            if next_flush is not None and len(actions_out) >= next_flush:
+                save_dataset(args.output, maps, auxes, actions_out, compressed=args.compressed)
+                print(f"checkpoint saved {len(actions_out)} samples to {args.output}")
+                next_flush += args.flush_every
+
             step_actions = []
             for pid, agent in enumerate(opponents):
                 try:
@@ -66,16 +219,13 @@ def collect_dataset(args):
             obs, terminated, truncated = env.step(step_actions)
             if terminated or truncated or int(obs["players"][args.agent_id][2]) != 1:
                 break
+            if args.max_samples and len(actions_out) >= args.max_samples:
+                break
+        if args.max_samples and len(actions_out) >= args.max_samples:
+            break
 
-    output = Path(args.output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        output,
-        map=np.asarray(maps, dtype=np.float32),
-        aux=np.asarray(auxes, dtype=np.float32),
-        action=np.asarray(actions_out, dtype=np.int64),
-    )
-    print(f"saved {len(actions_out)} samples to {output}")
+    save_dataset(args.output, maps, auxes, actions_out, compressed=args.compressed)
+    print(f"saved {len(actions_out)} samples to {args.output}")
 
 
 def train_bc(args):
@@ -155,6 +305,11 @@ def main():
     collect.add_argument("--seed", type=int, default=86)
     collect.add_argument("--agent_id", type=int, default=0)
     collect.add_argument("--output", type=str, default="agent/lgl_agent/data/imitation_dataset.npz")
+    collect.add_argument("--max_samples", type=int, default=0)
+    collect.add_argument("--flush_every", type=int, default=1000)
+    collect.add_argument("--compressed", action="store_true")
+    collect.add_argument("--rule_only_teacher", action=argparse.BooleanOptionalAction, default=True)
+    collect.add_argument("--workers", type=int, default=1)
 
     train = sub.add_parser("train")
     train.add_argument("--dataset", type=str, default="agent/lgl_agent/data/imitation_dataset.npz")
