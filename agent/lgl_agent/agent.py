@@ -267,15 +267,22 @@ class Agent:
             escape = self._best_escape_action(c, safe_actions)
             return escape if escape is not None else 0
 
+        endgame = len(c["enemies"]) == 1
+        if endgame:
+            pressure = self._endgame_pressure_action(c, safe_actions)
+            if pressure is not None:
+                return pressure
+
         if c["bombs_left"] > 0 and 5 in safe_actions:
             boxes = self._count_boxes_in_blast(c["grid"], my_pos, c["radius"])
             hit_enemy = self._can_hit_enemy(c["grid"], my_pos, c["enemies"], c["radius"])
             if hit_enemy or boxes >= 2:
                 return 5
 
-        item_move = self._move_to_targets(c, self._item_targets(c), safe_actions)
-        if item_move is not None:
-            return item_move
+        if not endgame:
+            item_move = self._move_to_targets(c, self._item_targets(c), safe_actions)
+            if item_move is not None:
+                return item_move
 
         if c["bombs_left"] > 0 and 5 in safe_actions:
             boxes = self._count_boxes_in_blast(c["grid"], my_pos, c["radius"])
@@ -292,6 +299,29 @@ class Agent:
 
         non_stop = [a for a in safe_actions if a != 0]
         return int(self._rng.choice(non_stop or safe_actions or [0]))
+
+    def _endgame_pressure_action(self, c, safe_actions):
+        my_pos = c["my_pos"]
+        enemy_distance = self._nearest_enemy_distance(c)
+        if enemy_distance > 6:
+            item_move = self._move_to_targets(c, self._item_targets(c), safe_actions, max_depth=4)
+            if item_move is not None:
+                return item_move
+
+        if c["bombs_left"] > 0 and 5 in safe_actions:
+            if self._can_hit_enemy(c["grid"], my_pos, c["enemies"], c["radius"]):
+                return 5
+
+        attack_move = self._move_to_targets(c, self._enemy_attack_spots(c), safe_actions)
+        if attack_move is not None:
+            return attack_move
+
+        if enemy_distance <= 4:
+            enemy_move = self._move_to_targets(c, set(c["enemies"]), safe_actions)
+            if enemy_move is not None:
+                return enemy_move
+
+        return None
 
     def _safe_actions(self, c):
         valid = self._valid_actions(c)
@@ -452,7 +482,7 @@ class Agent:
                 q.append((npos, nt, action if first is None else first))
         return False
 
-    def _move_to_targets(self, c, targets, safe_actions):
+    def _move_to_targets(self, c, targets, safe_actions, max_depth=12):
         if not targets:
             return None
         safe_first = set(a for a in safe_actions if a in (1, 2, 3, 4))
@@ -462,7 +492,7 @@ class Agent:
             pos, first, dist = q.popleft()
             if pos in targets and first is not None:
                 return first
-            if dist >= 12:
+            if dist >= max_depth:
                 continue
             for action in (1, 2, 3, 4):
                 if first is None and action not in safe_first:
@@ -506,6 +536,32 @@ class Agent:
                     nx, ny = x + dx, y + dy
                     if self._passable(grid, nx, ny) and (nx, ny) not in c["blocked"]:
                         spots.add((nx, ny))
+        return spots
+
+    def _enemy_attack_spots(self, c):
+        spots = set()
+        grid = c["grid"]
+        radius = int(c["radius"])
+        for enemy in c["enemies"]:
+            ex, ey = enemy
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                for dist in range(1, radius + 1):
+                    x, y = ex + dx * dist, ey + dy * dist
+                    if not (0 <= x < grid.shape[0] and 0 <= y < grid.shape[1]):
+                        break
+                    cell = int(grid[x, y])
+                    if cell == WALL:
+                        break
+                    if cell == BOX:
+                        break
+                    pos = (x, y)
+                    if (
+                        self._passable(grid, x, y)
+                        and pos not in c["blocked"]
+                        and not self._danger_at(c["danger_time"], pos, 0)
+                        and self._line_clear(grid, pos, enemy)
+                    ):
+                        spots.add(pos)
         return spots
 
     def _can_hit_enemy(self, grid, my_pos, enemies, radius):
