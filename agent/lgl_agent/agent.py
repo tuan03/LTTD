@@ -312,7 +312,7 @@ class Agent:
             if self._can_hit_enemy(c["grid"], my_pos, c["enemies"], c["radius"]):
                 return 5
 
-        attack_move = self._move_to_targets(c, self._enemy_attack_spots(c), safe_actions)
+        attack_move = self._move_to_best_attack_spot(c, self._enemy_attack_spots(c), safe_actions)
         if attack_move is not None:
             return attack_move
 
@@ -507,6 +507,48 @@ class Agent:
                 seen.add(npos)
                 q.append((npos, action if first is None else first, dist + 1))
         return None
+
+    def _move_to_best_attack_spot(self, c, targets, safe_actions, max_depth=12):
+        if not targets:
+            return None
+        safe_first = set(a for a in safe_actions if a in (1, 2, 3, 4))
+        q = deque([(c["my_pos"], None, 0)])
+        seen = {c["my_pos"]}
+        best_action = None
+        best_score = -10**9
+
+        while q:
+            pos, first, dist = q.popleft()
+            if pos in targets and first is not None:
+                score = self._attack_spot_score(c, pos, dist)
+                if score > best_score:
+                    best_score = score
+                    best_action = first
+            if dist >= max_depth:
+                continue
+            for action in (1, 2, 3, 4):
+                if first is None and action not in safe_first:
+                    continue
+                npos = self._next_pos(pos, action)
+                if npos in seen:
+                    continue
+                if not self._passable(c["grid"], npos[0], npos[1]) or npos in c["blocked"]:
+                    continue
+                if self._danger_at(c["danger_time"], npos, dist + 1):
+                    continue
+                seen.add(npos)
+                q.append((npos, action if first is None else first, dist + 1))
+        return best_action
+
+    def _attack_spot_score(self, c, pos, dist):
+        x, y = pos
+        enemy_dist = min((abs(x - ex) + abs(y - ey) for ex, ey in c["enemies"]), default=12)
+        score = 0
+        score -= int(dist) * 3
+        score -= enemy_dist
+        score += self._open_neighbor_count(c, pos) * 4
+        score += min(int(c["danger_time"][x, y]), 8)
+        return score
 
     def _item_targets(self, c):
         grid = c["grid"]
