@@ -135,6 +135,10 @@ def main():
     parser.add_argument("--update_every", type=int, default=8)
     parser.add_argument("--ppo_epochs", type=int, default=4)
     parser.add_argument("--cpu", action="store_true")
+    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--min_delta", type=float, default=0.01)
+    parser.add_argument("--recent_window", type=int, default=50)
+    parser.add_argument("--save_best", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -155,6 +159,11 @@ def main():
 
     buffer = []
     wins = []
+    episode_rewards = []
+    best_score = -1.0
+    best_avg_reward = -float("inf")
+    best_state = None
+    stale_updates = 0
     for ep in tqdm(range(args.episodes), desc="ppo"):
         obs = env.reset(seed=args.seed + ep)
         opponents = []
@@ -199,14 +208,41 @@ def main():
                 break
 
         wins.append(1 if int(obs["players"][args.agent_id][2]) == 1 and sum(int(p[2]) for p in obs["players"]) <= 1 else 0)
+        episode_rewards.append(ep_reward)
         if (ep + 1) % args.update_every == 0 and buffer:
             update(policy, value, opt, buffer, args, device)
             buffer.clear()
-            print(f"episode={ep + 1} reward={ep_reward:.2f} recent_win={np.mean(wins[-50:]):.3f}")
+            recent_win = float(np.mean(wins[-args.recent_window:]))
+            recent_reward = float(np.mean(episode_rewards[-args.recent_window:]))
+            improved = recent_win > best_score + args.min_delta
+            if improved:
+                best_score = recent_win
+                best_avg_reward = recent_reward
+                best_state = {k: v.detach().cpu().clone() for k, v in policy.state_dict().items()}
+                stale_updates = 0
+            else:
+                stale_updates += 1
+            print(
+                f"episode={ep + 1} reward={ep_reward:.2f} recent_win={recent_win:.3f} "
+                f"recent_reward={recent_reward:.3f} best_win={best_score:.3f} stale={stale_updates}"
+            )
+            if args.patience > 0 and stale_updates >= args.patience:
+                print(f"early stopping after {ep + 1} episodes")
+                break
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"model_state_dict": policy.cpu().state_dict()}, output)
+    if best_state is not None and args.save_best:
+        policy.load_state_dict(best_state)
+    torch.save(
+        {
+            "model_state_dict": policy.cpu().state_dict(),
+            "best_recent_win": best_score,
+            "best_recent_reward": best_avg_reward,
+            "recent_window": args.recent_window,
+        },
+        output,
+    )
     print(f"saved PPO-tuned policy to {output}")
 
 
