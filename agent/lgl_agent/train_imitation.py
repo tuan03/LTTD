@@ -37,7 +37,7 @@ def make_opponent(agent_id: int, name: str):
     return TacticalRuleAgent(agent_id)
 
 
-def save_dataset(output_path, maps, auxes, actions_out, compressed=False):
+def save_dataset(output_path, maps, auxes, actions_out, episodes_out=None, compressed=False):
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     tmp_output = output.with_name(output.name + ".tmp")
@@ -46,6 +46,8 @@ def save_dataset(output_path, maps, auxes, actions_out, compressed=False):
         "aux": np.asarray(auxes, dtype=np.float32),
         "action": np.asarray(actions_out, dtype=np.int64),
     }
+    if episodes_out is not None:
+        payload["episode"] = np.asarray(episodes_out, dtype=np.int64)
     saver = np.savez_compressed if compressed else np.savez
     with tmp_output.open("wb") as f:
         saver(f, **payload)
@@ -61,6 +63,8 @@ def collect_samples(args, seed, episodes, max_samples, flush_path=None, worker_i
     maps = []
     auxes = []
     actions_out = []
+    episodes_out = []
+    episodes_out = []
     opponent_names = ["tactical", "genius", "smarter", "box_farmer", "random"]
     next_flush = args.flush_every if args.flush_every > 0 and flush_path is not None else None
     next_episode_flush = args.flush_episodes if args.flush_episodes > 0 and flush_path is not None else None
@@ -68,6 +72,7 @@ def collect_samples(args, seed, episodes, max_samples, flush_path=None, worker_i
     last_progress = 0
 
     for ep in range(episodes):
+        episode_id = seed + ep
         obs = env.reset(seed=seed + ep)
         opponents = []
         for pid in range(4):
@@ -82,9 +87,10 @@ def collect_samples(args, seed, episodes, max_samples, flush_path=None, worker_i
             maps.append(map_x)
             auxes.append(aux)
             actions_out.append(action)
+            episodes_out.append(episode_id)
 
             if next_flush is not None and len(actions_out) >= next_flush:
-                save_dataset(flush_path, maps, auxes, actions_out, compressed=args.compressed)
+                save_dataset(flush_path, maps, auxes, actions_out, episodes_out, compressed=args.compressed)
                 next_flush += args.flush_every
             if next_progress is not None and len(actions_out) >= next_progress:
                 progress_queue.put(("sample", worker_id, len(actions_out) - last_progress))
@@ -105,20 +111,20 @@ def collect_samples(args, seed, episodes, max_samples, flush_path=None, worker_i
         if progress_queue is not None:
             progress_queue.put(("episode", worker_id, 1))
         if next_episode_flush is not None and ep + 1 >= next_episode_flush:
-            save_dataset(flush_path, maps, auxes, actions_out, compressed=args.compressed)
+            save_dataset(flush_path, maps, auxes, actions_out, episodes_out, compressed=args.compressed)
             next_episode_flush += args.flush_episodes
         if max_samples and len(actions_out) >= max_samples:
             break
 
     if progress_queue is not None and len(actions_out) > last_progress:
         progress_queue.put(("sample", worker_id, len(actions_out) - last_progress))
-    return maps, auxes, actions_out
+    return maps, auxes, actions_out, episodes_out
 
 
 def collect_worker(payload):
     args, worker_id, episodes, max_samples, shard_path, progress_queue = payload
     seed = int(args.seed) + worker_id * 1000003
-    maps, auxes, actions_out = collect_samples(
+    maps, auxes, actions_out, episodes_out = collect_samples(
         args,
         seed,
         episodes,
@@ -127,7 +133,7 @@ def collect_worker(payload):
         worker_id=worker_id,
         progress_queue=progress_queue,
     )
-    save_dataset(shard_path, maps, auxes, actions_out, compressed=args.compressed)
+    save_dataset(shard_path, maps, auxes, actions_out, episodes_out, compressed=args.compressed)
     return str(shard_path), len(actions_out)
 
 
@@ -135,6 +141,7 @@ def merge_shards(shard_paths, output_path, max_samples=0, compressed=False):
     map_parts = []
     aux_parts = []
     action_parts = []
+    episode_parts = []
     total = 0
     for shard_path in shard_paths:
         data = np.load(shard_path)
@@ -145,6 +152,8 @@ def merge_shards(shard_paths, output_path, max_samples=0, compressed=False):
         map_parts.append(data["map"][:take])
         aux_parts.append(data["aux"][:take])
         action_parts.append(data["action"][:take])
+        if "episode" in data.files:
+            episode_parts.append(data["episode"][:take])
         total += take
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -156,6 +165,7 @@ def merge_shards(shard_paths, output_path, max_samples=0, compressed=False):
             map=np.concatenate(map_parts, axis=0) if map_parts else np.empty((0, 12, 13, 13), dtype=np.float32),
             aux=np.concatenate(aux_parts, axis=0) if aux_parts else np.empty((0, 16), dtype=np.float32),
             action=np.concatenate(action_parts, axis=0) if action_parts else np.empty((0,), dtype=np.int64),
+            episode=np.concatenate(episode_parts, axis=0) if episode_parts else np.empty((0,), dtype=np.int64),
         )
     tmp_output.replace(output)
     return total
@@ -297,6 +307,7 @@ def collect_dataset(args):
 
     progress = tqdm(range(args.episodes), desc="collect episodes", unit="episode")
     for ep in progress:
+        episode_id = args.seed + ep
         obs = env.reset(seed=args.seed + ep)
         opponents = []
         for pid in range(4):
@@ -311,9 +322,10 @@ def collect_dataset(args):
             maps.append(map_x)
             auxes.append(aux)
             actions_out.append(action)
+            episodes_out.append(episode_id)
 
             if next_flush is not None and len(actions_out) >= next_flush:
-                save_dataset(args.output, maps, auxes, actions_out, compressed=args.compressed)
+                save_dataset(args.output, maps, auxes, actions_out, episodes_out, compressed=args.compressed)
                 print(f"checkpoint saved {len(actions_out)} samples to {args.output}")
                 next_flush += args.flush_every
 
@@ -330,13 +342,13 @@ def collect_dataset(args):
                 break
         progress.set_postfix(samples=len(actions_out), target=args.max_samples or "all")
         if next_episode_flush is not None and ep + 1 >= next_episode_flush:
-            save_dataset(args.output, maps, auxes, actions_out, compressed=args.compressed)
+            save_dataset(args.output, maps, auxes, actions_out, episodes_out, compressed=args.compressed)
             print(f"episode checkpoint saved {len(actions_out)} samples after {ep + 1} episodes to {args.output}")
             next_episode_flush += args.flush_episodes
         if args.max_samples and len(actions_out) >= args.max_samples:
             break
 
-    save_dataset(args.output, maps, auxes, actions_out, compressed=args.compressed)
+    save_dataset(args.output, maps, auxes, actions_out, episodes_out, compressed=args.compressed)
     print(f"saved {len(actions_out)} samples to {args.output}")
 
 
@@ -347,10 +359,8 @@ def train_bc(args):
     y = torch.from_numpy(data["action"]).long()
 
     n = len(y)
-    order = torch.randperm(n)
-    split = int(n * 0.9)
-    train_idx = order[:split]
-    val_idx = order[split:]
+    train_idx, val_idx = make_train_val_split(data, n, args.val_ratio, args.seed)
+    print(f"split: train_samples={len(train_idx)} val_samples={len(val_idx)}")
 
     train_ds = TensorDataset(map_x[train_idx], aux_x[train_idx], y[train_idx])
     val_ds = TensorDataset(map_x[val_idx], aux_x[val_idx], y[val_idx])
@@ -435,6 +445,36 @@ def evaluate_validation(model, loader, loss_fn, device):
     return total_loss / max(1, seen), correct / max(1, seen)
 
 
+def make_train_val_split(data, n, val_ratio, seed):
+    if "episode" not in data.files or len(data["episode"]) != n:
+        print("warning: dataset has no episode ids; falling back to random sample split")
+        order = torch.randperm(n)
+        split = int(n * (1.0 - val_ratio))
+        return order[:split], order[split:]
+
+    episodes = np.asarray(data["episode"], dtype=np.int64)
+    unique_episodes = np.unique(episodes)
+    if len(unique_episodes) < 2:
+        print("warning: dataset has fewer than 2 episodes; falling back to random sample split")
+        order = torch.randperm(n)
+        split = int(n * (1.0 - val_ratio))
+        return order[:split], order[split:]
+    rng = np.random.default_rng(seed)
+    rng.shuffle(unique_episodes)
+    val_count = max(1, int(round(len(unique_episodes) * val_ratio)))
+    if val_count >= len(unique_episodes):
+        val_count = max(1, len(unique_episodes) - 1)
+    val_episodes = set(int(ep) for ep in unique_episodes[:val_count])
+    val_mask = np.array([int(ep) in val_episodes for ep in episodes], dtype=np.bool_)
+    val_idx_np = np.flatnonzero(val_mask)
+    train_idx_np = np.flatnonzero(~val_mask)
+    print(
+        f"episode split: train_episodes={len(unique_episodes) - val_count} "
+        f"val_episodes={val_count}"
+    )
+    return torch.from_numpy(train_idx_np).long(), torch.from_numpy(val_idx_np).long()
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -463,6 +503,8 @@ def main():
     train.add_argument("--patience", type=int, default=10)
     train.add_argument("--min_delta", type=float, default=0.001)
     train.add_argument("--save_best", action=argparse.BooleanOptionalAction, default=True)
+    train.add_argument("--val_ratio", type=float, default=0.1)
+    train.add_argument("--seed", type=int, default=86)
 
     args = parser.parse_args()
     if args.cmd == "collect":

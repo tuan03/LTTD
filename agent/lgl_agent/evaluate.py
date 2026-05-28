@@ -17,9 +17,21 @@ from agent import BoxFarmerAgent, GeniusRuleAgent, RandomAgent, SmarterRuleAgent
 from engine import BomberEnv
 
 
-def make_agent(agent_id, name):
+def make_lgl_agent(agent_id, model_path=None, rule_only=False):
+    agent = Agent(agent_id)
+    if rule_only:
+        agent.model = None
+        return agent
+    if model_path:
+        agent.model = None
+        agent.model_path = Path(model_path)
+        agent._load_model_if_present()
+    return agent
+
+
+def make_agent(agent_id, name, model_path=None, rule_only=False):
     if name == "lgl":
-        return Agent(agent_id)
+        return make_lgl_agent(agent_id, model_path=model_path, rule_only=rule_only)
     if name == "random":
         return RandomAgent(agent_id)
     if name == "smarter":
@@ -37,6 +49,8 @@ def main():
     parser.add_argument("--max_steps", type=int, default=500)
     parser.add_argument("--seed", type=int, default=86)
     parser.add_argument("--agent_id", type=int, default=0)
+    parser.add_argument("--model_path", type=str, default=None)
+    parser.add_argument("--rule_only", action="store_true")
     parser.add_argument(
         "--opponents",
         nargs=3,
@@ -44,6 +58,8 @@ def main():
         choices=["random", "smarter", "genius", "box_farmer", "tactical"],
     )
     args = parser.parse_args()
+    if args.rule_only and args.model_path:
+        parser.error("--rule_only and --model_path cannot be used together")
 
     random.seed(args.seed)
     env = BomberEnv(max_steps=args.max_steps, seed=args.seed)
@@ -55,7 +71,12 @@ def main():
     for ep in progress:
         obs = env.reset(seed=args.seed + ep)
         agents = [None] * 4
-        agents[args.agent_id] = make_agent(args.agent_id, "lgl")
+        agents[args.agent_id] = make_agent(
+            args.agent_id,
+            "lgl",
+            model_path=args.model_path,
+            rule_only=args.rule_only,
+        )
         opp_iter = iter(args.opponents)
         for pid in range(4):
             if pid != args.agent_id:
@@ -90,6 +111,9 @@ def main():
     print("=== LGL evaluation ===")
     print(f"episodes: {args.episodes}")
     print(f"opponents: {args.opponents}")
+    print(f"mode: {'rule_only' if args.rule_only else 'model'}")
+    if args.model_path:
+        print(f"model_path: {args.model_path}")
     print(f"wins: {wins} ({wins / args.episodes:.3f})")
     print(f"survived: {survived} ({survived / args.episodes:.3f})")
     print(f"avg_steps: {float(np.mean(steps)):.1f}")
